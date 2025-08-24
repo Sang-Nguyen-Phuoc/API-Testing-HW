@@ -1,0 +1,213 @@
+name: API Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test against'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      test_collection:
+        description: 'Test collection to run'
+        required: false
+        default: 'all'
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  api-tests:
+    name: Run API Tests
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        environment: [staging]
+        # Add production when ready: [staging, production]
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install Newman and Dependencies
+      run: |
+        npm install -g newman
+        npm install -g newman-reporter-htmlextra
+        npm install -g newman-reporter-junitfull
+
+    - name: Create Reports Directory
+      run: |
+        mkdir -p tests/reports
+        mkdir -p tests/reports/html
+        mkdir -p tests/reports/junit
+
+    - name: Set Environment Variables
+      run: |
+        if [ "${{ github.event.inputs.environment }}" != "" ]; then
+          echo "TEST_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+        else
+          echo "TEST_ENV=${{ matrix.environment }}" >> $GITHUB_ENV
+        fi
+        echo "TIMESTAMP=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+
+    - name: Wait for Application to be Ready
+      run: |
+        # Replace with your health check endpoint
+        timeout 300s bash -c 'until curl -f ${{ secrets.API_BASE_URL }}/health; do sleep 5; done'
+      env:
+        API_BASE_URL: ${{ secrets.API_BASE_URL }}
+
+    - name: Run Postman Collection Tests
+      run: |
+        newman run tests/postman/collections/api-collection.json \
+          --environment tests/postman/environments/${{ env.TEST_ENV }}.json \
+          --iteration-data tests/postman/data/test-data.csv \
+          --reporters cli,htmlextra,junitfull \
+          --reporter-htmlextra-export tests/reports/html/api-test-report-${{ env.TIMESTAMP }}.html \
+          --reporter-htmlextra-title "API Tests - ${{ env.TEST_ENV }} Environment" \
+          --reporter-htmlextra-titleSize 4 \
+          --reporter-htmlextra-logs \
+          --reporter-junitfull-export tests/reports/junit/api-test-results-${{ env.TIMESTAMP }}.xml \
+          --delay-request 100 \
+          --timeout-request 10000 \
+          --ignore-redirects \
+          --color on
+      env:
+        API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        API_KEY: ${{ secrets.API_KEY }}
+
+    - name: Upload Test Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: api-test-reports-${{ env.TEST_ENV }}-${{ env.TIMESTAMP }}
+        path: tests/reports/
+        retention-days: 30
+
+    - name: Publish Test Results
+      uses: dorny/test-reporter@v1
+      if: always()
+      with:
+        name: API Tests (${{ env.TEST_ENV }})
+        path: tests/reports/junit/*.xml
+        reporter: java-junit
+        fail-on-error: true
+
+    - name: Comment PR with Test Results
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request' && always()
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Find the latest HTML report
+          const reportsDir = 'tests/reports/html';
+          const files = fs.readdirSync(reportsDir);
+          const htmlReport = files.find(f => f.endsWith('.html'));
+          
+          if (htmlReport) {
+            const reportPath = path.join(reportsDir, htmlReport);
+            const reportUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            
+            const comment = `## 🧪 API Test Results
+            
+            **Environment:** ${{ env.TEST_ENV }}
+            **Status:** ${{ job.status }}
+            
+            📊 [View Detailed Report](${reportUrl})
+            
+            The API tests have been executed against the ${{ env.TEST_ENV }} environment.
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+          }
+
+    - name: Notify Slack on Failure
+      uses: 8398a7/action-slack@v3
+      if: failure()
+      with:
+        status: failure
+        channel: '#api-alerts'
+        text: |
+          🚨 API Tests Failed!
+          
+          Environment: ${{ env.TEST_ENV }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          View logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Optional: Security and Performance Tests
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    needs: api-tests
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Run OWASP ZAP Baseline Scan
+      uses: zaproxy/action-baseline@v0.7.0
+      with:
+        target: ${{ secrets.API_BASE_URL }}
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: '-a'
+
+  # Optional: Load Testing
+  load-tests:
+    name: Load Tests
+    runs-on: ubuntu-latest
+    needs: api-tests
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install K6
+      run: |
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+
+    - name: Convert Postman to K6
+      run: |
+        npm install -g @apideck/postman-to-k6
+        postman-to-k6 tests/postman/collections/api-collection.json -e tests/postman/environments/staging.json -o tests/k6-script.js
+
+    - name: Run Load Tests
+      run: |
+        k6 run --vus 10 --duration 30s tests/k6-script.js
